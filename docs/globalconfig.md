@@ -258,9 +258,9 @@ Which interpreter pi-lens runs the project's Python tooling with. A Python entry
 
 | Value | Chain |
 | --- | --- |
-| `"auto"` (default) | the project's venv (`VIRTUAL_ENV`, `CONDA_PREFIX`, then `.venv`/`venv` from the test file's directory up to the project root) → `uv run --no-sync` when the project declares uv (`uv.lock` or `[tool.uv]`) → `python3` → `python` |
+| `"auto"` (default) | `uv run --no-sync` when the project declares uv (`uv.lock` or `[tool.uv]`) **and** its environment already exists → the project's venv (`VIRTUAL_ENV`, `CONDA_PREFIX`, `UV_PROJECT_ENVIRONMENT`, then `.venv`/`venv` from the test file's directory up to the project root) → `python3` → `python` |
 | `"venv"` | venv only; never reaches for uv |
-| `"uv"` | `uv run --no-sync`, with no `uv.lock`/`[tool.uv]` marker required |
+| `"uv"` | `uv run --no-sync`, with no `uv.lock`/`[tool.uv]` marker and no existing environment required |
 | `"system"` | ignore any venv and use the interpreter on PATH |
 
 `python.testCommand` — a full command prefix, used verbatim with the runner's own argv tail appended. Wins over `interpreter`, which is then not consulted:
@@ -269,7 +269,8 @@ Which interpreter pi-lens runs the project's Python tooling with. A Python entry
 { "python": { "testCommand": ["uv", "run", "--frozen", "pytest"] } }
 ```
 
-- `uv` is always invoked with `--no-sync` when pi-lens picks it, so an edit-triggered test run never installs packages or reaches the network on your behalf. Use `testCommand` if you want different uv flags.
+- **A uv-managed project runs its tests through uv**, regardless of what `python` is on PATH or in `.venv` — uv, not a path guess, is the authority on which environment and which interpreter that project uses (workspace members, a relocated `UV_PROJECT_ENVIRONMENT`, `requires-python`).
+- `uv` is always invoked with `--no-sync`, so a test run installs no dependencies and leaves `uv.lock` untouched. `--no-sync` is *not* inert, though: on a project with no environment uv still **creates** the venv, and then — finding no pytest in that empty environment — silently runs whatever `pytest` is on PATH, exit code 0. That is why `auto` waits for an environment to exist before reaching for uv; an explicit `interpreter: "uv"` skips that wait and may create the environment. Use `testCommand` for different uv flags (e.g. `--frozen`, which does sync).
 - Every mode still falls back to `python3`/`python` rather than failing the run, so a configured interpreter that is missing degrades to the old behavior instead of silently reporting no tests.
 - Nothing is cached: a venv created (or this config edited) mid-session is picked up on the next run.
 - Scope: this section governs the **test runner**. The Python LSP (pyright/basedpyright) discovers the venv on its own — `VIRTUAL_ENV`, `CONDA_PREFIX`, then `.venv`/`venv` at the LSP root and a bounded number of directories above it — and is not affected by `interpreter` or `testCommand`.

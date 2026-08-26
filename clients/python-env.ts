@@ -11,16 +11,31 @@
  *
  * Resolution order under `auto` (the default):
  *   1. `python.testCommand` from `.pi-lens.json` — verbatim, no PATH probe
- *   2. the active/declared venv's own `pytest` entry point
- *   3. that venv's `python -m pytest`
- *   4. `uv run --no-sync pytest`, for a uv-managed project with uv installed
+ *   2. `uv run --no-sync pytest`, for a uv-managed project whose environment
+ *      already exists — uv, not a path guess, is the authority on which
+ *      environment and which interpreter that project uses
+ *   3. the active/declared venv's own `pytest` entry point
+ *   4. that venv's `python -m pytest`
  *   5. `python3 -m pytest`
  *   6. `python -m pytest` — the old behavior, now last instead of only
  *
- * `--no-sync` is deliberate, and verified against a real uv 0.12.5 (shape 16):
- * bare `uv run` SYNCS the environment first, so it can install packages and
- * reach the network. A test run triggered by an edit must never mutate the
- * user's environment as a side effect.
+ * Two uv facts behind that ordering, both verified against a real uv 0.12.5
+ * rather than from its docs (shape 16):
+ *
+ *   - Bare `uv run` SYNCS first, so it can install packages and reach the
+ *     network. `--no-sync` suppresses that, and leaves `uv.lock` untouched
+ *     (same hash and mtime across a run).
+ *   - `--no-sync` is NOT inert, though: on a project with no environment it
+ *     still CREATES the venv (it skips installing dependencies, not creating
+ *     the environment), and then — finding no pytest in that empty env —
+ *     silently runs whatever `pytest` is on PATH, exit code 0. On a machine
+ *     whose `python` is still 2.7 that means pytest 4.6.11 under Python 2.7:
+ *     the exact defect this module exists to fix, reintroduced through uv.
+ *
+ * Hence the gate in `uvWanted`: `auto` prefers uv for a uv-managed project,
+ * but only once an environment exists for uv to use. An explicit
+ * `interpreter: "uv"` is the user's own instruction and is honored without
+ * that gate.
  *
  * Nothing here is memoized. Every answer is a live read of the environment,
  * PATH, and the filesystem, so a venv created — or a config edited — mid-session
@@ -34,6 +49,7 @@ import * as path from "node:path";
 import {
 	loadPiLensProjectConfig,
 	type PiLensProjectPythonConfig,
+	type PythonInterpreterMode,
 } from "./project-lens-config.js";
 
 /** Which step of the chain produced the command — logged, and asserted in tests. */
@@ -144,6 +160,13 @@ export function venvRootCandidates(cwd: string, anchorDir: string): string[] {
 		const declared = process.env[key];
 		if (declared) roots.push(declared);
 	}
+	// uv's own override for where the project environment lives. Resolved
+	// against the project root when relative, which is how uv reads it. Without
+	// this, a project that moves its environment off `.venv` looks environment-
+	// less, and `auto` would decline to use uv for the very project that
+	// configured uv most deliberately.
+	const uvEnv = process.env.UV_PROJECT_ENVIRONMENT;
+	if (uvEnv) roots.push(path.resolve(cwd, uvEnv));
 	for (const dir of venvSearchDirs(cwd, anchorDir)) {
 		for (const name of VENV_DIR_NAMES) roots.push(path.join(dir, name));
 	}
@@ -241,6 +264,27 @@ export function findPyprojectDeclaringPytest(
 	return null;
 }
 
+/**
+ * Whether this run should go through `uv run`.
+ *
+ * An explicit `interpreter: "uv"` is an instruction and needs no evidence. For
+ * `auto` the project must both DECLARE uv and already HAVE an environment: see
+ * the module comment for why an environment-less `uv run --no-sync` is worse
+ * than not using uv at all (it creates an empty venv, then silently falls back
+ * to a PATH pytest that can be the wrong interpreter entirely).
+ */
+function uvWanted(
+	mode: PythonInterpreterMode,
+	cwd: string,
+	anchorDir: string,
+): boolean {
+	if (mode === "uv") return true;
+	if (!venvSearchDirs(cwd, anchorDir).some((dir) => isUvManagedProject(dir))) {
+		return false;
+	}
+	return findVenvBinary("python", cwd, anchorDir) !== null;
+}
+
 function projectPythonConfig(cwd: string): PiLensProjectPythonConfig {
 	return loadPiLensProjectConfig(cwd).python ?? {};
 }
@@ -269,6 +313,22 @@ export function resolvePytestExec(request: PytestExecRequest): PythonExec {
 	const mode = config.interpreter ?? "auto";
 	const anchorDir = path.dirname(path.resolve(testFile));
 
+	// uv goes FIRST for a uv-managed project. Running `.venv/bin/pytest`
+	// directly is a guess at a path; `uv run` asks the tool that owns the
+	// project which environment and interpreter to use — workspace members, a
+	// relocated `UV_PROJECT_ENVIRONMENT`, and `requires-python` all resolve the
+	// way the project declares rather than the way a directory name suggests.
+	if (mode === "auto" || mode === "uv") {
+		const uv = uvWanted(mode, cwd, anchorDir) ? findOnPath("uv") : null;
+		if (uv) {
+			return {
+				command: uv,
+				args: ["run", "--no-sync", "pytest", ...tailArgs],
+				source: "uv",
+			};
+		}
+	}
+
 	if (mode === "auto" || mode === "venv") {
 		const venvPytest = findVenvBinary("pytest", cwd, anchorDir);
 		if (venvPytest) {
@@ -282,22 +342,6 @@ export function resolvePytestExec(request: PytestExecRequest): PythonExec {
 				command: venvPython,
 				args: ["-m", "pytest", ...tailArgs],
 				source: "venv-python",
-			};
-		}
-	}
-
-	if (mode === "auto" || mode === "uv") {
-		// `auto` only reaches for uv on a project that declares it; an explicit
-		// `"uv"` is the user's instruction and needs no marker on disk.
-		const wanted =
-			mode === "uv" ||
-			venvSearchDirs(cwd, anchorDir).some((dir) => isUvManagedProject(dir));
-		const uv = wanted ? findOnPath("uv") : null;
-		if (uv) {
-			return {
-				command: uv,
-				args: ["run", "--no-sync", "pytest", ...tailArgs],
-				source: "uv",
 			};
 		}
 	}

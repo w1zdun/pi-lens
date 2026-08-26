@@ -2914,7 +2914,13 @@ describe("pytest interpreter resolution — venv / uv / project config", () => {
 	const savedEnv: Record<string, string | undefined> = {};
 
 	beforeEach(() => {
-		for (const key of ["PATH", "Path", "VIRTUAL_ENV", "CONDA_PREFIX"]) {
+		for (const key of [
+			"PATH",
+			"Path",
+			"VIRTUAL_ENV",
+			"CONDA_PREFIX",
+			"UV_PROJECT_ENVIRONMENT",
+		]) {
 			savedEnv[key] = process.env[key];
 		}
 		resetProjectLensConfigCache();
@@ -2933,6 +2939,7 @@ describe("pytest interpreter resolution — venv / uv / project config", () => {
 	function isolatePath(...dirs: string[]): void {
 		delete process.env.VIRTUAL_ENV;
 		delete process.env.CONDA_PREFIX;
+		delete process.env.UV_PROJECT_ENVIRONMENT;
 		process.env.PATH = dirs.join(path.delimiter);
 	}
 
@@ -3058,9 +3065,10 @@ describe("pytest interpreter resolution — venv / uv / project config", () => {
 		expect(resolved.command).toBe(paths.pytest);
 	});
 
-	it("uses uv run --no-sync for a uv-managed project with no venv on disk", async () => {
+	it("prefers uv over the venv's own pytest in a uv-managed project", async () => {
 		const root = tempProject();
 		fs.writeFileSync(path.join(root, "uv.lock"), "version = 1\n");
+		makeVenv(root, ".venv", ["python", "pytest"]);
 		const binDir = path.join(root, "path-bin");
 		const uvPath = writeFakeBinary(binDir, "uv");
 		isolatePath(binDir);
@@ -3068,8 +3076,9 @@ describe("pytest interpreter resolution — venv / uv / project config", () => {
 		const testFile = createTempFile(root, "tests/test_thing.py", "");
 		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
 
-		// --no-sync because a test run must never install into the user's
-		// environment behind their back; bare `uv run` would sync first.
+		// uv, not a path guess, is the authority on which environment and which
+		// interpreter a uv-managed project uses. --no-sync so the run neither
+		// installs dependencies nor rewrites uv.lock (both verified on uv 0.12.5).
 		expect(resolved.command).toBe(uvPath);
 		expect(resolved.args).toEqual([
 			"run",
@@ -3079,18 +3088,44 @@ describe("pytest interpreter resolution — venv / uv / project config", () => {
 		]);
 	});
 
-	it("prefers an existing venv over uv even in a uv-managed project", async () => {
+	it("does not reach for uv when a uv-managed project has no environment yet", async () => {
 		const root = tempProject();
 		fs.writeFileSync(path.join(root, "uv.lock"), "version = 1\n");
-		const { paths } = makeVenv(root, ".venv", ["python", "pytest"]);
 		const binDir = path.join(root, "path-bin");
 		writeFakeBinary(binDir, "uv");
+		const python3Path = writeFakeBinary(binDir, "python3");
 		isolatePath(binDir);
 
 		const testFile = createTempFile(root, "tests/test_thing.py", "");
 		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
 
-		expect(resolved.command).toBe(paths.pytest);
+		// Verified on uv 0.12.5: `uv run --no-sync` CREATES a missing project
+		// environment and then, finding no pytest in that empty env, silently
+		// runs whatever pytest is on PATH with exit 0 — on a machine whose
+		// `python` is 2.7, pytest 4.6.11 under Python 2.7. Reaching for uv here
+		// would reintroduce the defect this whole seam exists to fix, so `auto`
+		// waits until there is an environment for uv to use.
+		expect(resolved.command).toBe(python3Path);
+		expect(resolved.args).toEqual(["-m", "pytest", ...tail(testFile)]);
+	});
+
+	it("counts UV_PROJECT_ENVIRONMENT as the project's environment", async () => {
+		const root = tempProject();
+		fs.writeFileSync(path.join(root, "uv.lock"), "version = 1\n");
+		// Environment relocated off `.venv`, the way uv itself reads the variable.
+		makeVenv(root, "envs/ci", ["python", "pytest"]);
+		const binDir = path.join(root, "path-bin");
+		const uvPath = writeFakeBinary(binDir, "uv");
+		writeFakeBinary(binDir, "python3");
+		isolatePath(binDir);
+		process.env.UV_PROJECT_ENVIRONMENT = "envs/ci";
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		// Without the variable this project looks environment-less and `auto`
+		// would decline uv — for the project that configured uv most explicitly.
+		expect(resolved.command).toBe(uvPath);
 	});
 
 	it("prefers python3 over python when neither a venv nor uv applies", async () => {
@@ -3150,6 +3185,24 @@ describe("pytest interpreter resolution — venv / uv / project config", () => {
 
 		expect(resolved.command).toBe(python3Path);
 		expect(resolved.args).toEqual(["-m", "pytest", ...tail(testFile)]);
+	});
+
+	it("honors python.interpreter='venv', never reaching for uv", async () => {
+		const root = tempProject();
+		fs.writeFileSync(path.join(root, "uv.lock"), "version = 1\n");
+		fs.writeFileSync(
+			path.join(root, ".pi-lens.json"),
+			JSON.stringify({ python: { interpreter: "venv" } }),
+		);
+		const { paths } = makeVenv(root, ".venv", ["python", "pytest"]);
+		const binDir = path.join(root, "path-bin");
+		writeFakeBinary(binDir, "uv");
+		isolatePath(binDir);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe(paths.pytest);
 	});
 
 	it("honors python.interpreter='uv' without a uv.lock marker", async () => {

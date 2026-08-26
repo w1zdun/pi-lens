@@ -106,7 +106,7 @@ field docs.
 | `rules.<id>.select` | project | absent | Allowlist of rule ids (output-only filter, project-wide across every key; disable wins over select) |
 | `maxProjectFiles` | project | `2000` | Base scale knob; derives five subsystem size budgets |
 | `reviewGraph.maxFiles` | project | derived (clamped `100`–`20000`) | Explicit review-graph file budget |
-| `python.interpreter` | project | `"auto"` | Which interpreter runs the project's Python tooling: `auto` (venv → uv → `python3` → `python`), `venv`, `uv`, or `system` |
+| `python.interpreter` | project | `"auto"` | Which interpreter runs the project's Python tooling: `auto` (uv for a uv-managed project with an existing environment → venv → `python3` → `python`), `venv`, `uv`, or `system` |
 | `python.testCommand` | project | absent | Full command prefix for the project's tests, e.g. `["uv", "run", "--frozen", "pytest"]`; wins over `python.interpreter` |
 | `trivy.enabled` / `trivy.minSeverity` | project | off | Opt-in Trivy vulnerability scanning |
 | `helm.renderValidation.enabled` | project | off | Opt-in `helm template` rendering plus rendered-manifest validation. Rendering executes chart templates, so it **also requires host project trust** and is read from the chart's own project root — see below |
