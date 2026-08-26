@@ -95,6 +95,9 @@ const PROJECT_OWN_CONFIG_KEYS = [
 	"maxProjectFiles",
 	"reviewGraph",
 	"trivy",
+	// `python.interpreter` / `python.testCommand` — which interpreter pi-lens
+	// runs a project's Python tooling with (`clients/python-env.ts`).
+	"python",
 	// `helm.renderValidation.enabled` — the opt-in for rendered-manifest
 	// validation, read via `.raw` in the helm-render runner (#1283).
 	"helm",
@@ -140,6 +143,40 @@ export interface PiLensProjectReviewGraphConfig {
 	maxFiles?: number;
 }
 
+/**
+ * Which interpreter family pi-lens runs a project's Python tooling with.
+ *
+ * - `"auto"` (default) — the project's venv, then uv when the project declares
+ *   it, then `python3`, then `python`.
+ * - `"venv"` — venv only; never reaches for uv.
+ * - `"uv"` — `uv run --no-sync`, with no `uv.lock`/`[tool.uv]` marker required.
+ * - `"system"` — ignore any venv and use the interpreter on PATH.
+ *
+ * Every mode still falls back to `python3`/`python` rather than failing the run
+ * outright, so a mode whose interpreter is absent degrades to the old behavior
+ * instead of silently reporting no tests.
+ */
+export type PythonInterpreterMode = "auto" | "venv" | "uv" | "system";
+
+export const PYTHON_INTERPRETER_MODES: readonly PythonInterpreterMode[] = [
+	"auto",
+	"venv",
+	"uv",
+	"system",
+];
+
+export interface PiLensProjectPythonConfig {
+	/** Interpreter family; `undefined` means `"auto"`. */
+	interpreter?: PythonInterpreterMode;
+	/**
+	 * Full command prefix to run the project's tests with, e.g.
+	 * `["uv", "run", "--frozen", "pytest"]`. Used verbatim — the runner's own
+	 * argv tail (the test file and its flags) is appended. Wins over
+	 * `interpreter`, which is then not consulted at all.
+	 */
+	testCommand?: string[];
+}
+
 /** Clamp bounds for `reviewGraph.maxFiles` — see the field's doc comment above. */
 const REVIEW_GRAPH_MAX_FILES_MIN = 100;
 const REVIEW_GRAPH_MAX_FILES_MAX = 20_000;
@@ -169,6 +206,11 @@ export interface PiLensProjectConfig {
 	 * `clients/project-scale.ts`'s `getReviewGraphMaxFilesDerived`.
 	 */
 	reviewGraph?: PiLensProjectReviewGraphConfig;
+	/**
+	 * Which interpreter pi-lens runs the project's Python tooling with.
+	 * `undefined` means "auto" — see `clients/python-env.ts`.
+	 */
+	python?: PiLensProjectPythonConfig;
 	/** The parsed JSON as-is, for forward-compat consumers. */
 	raw: unknown;
 	/** Absolute path of the config file that was loaded, or undefined if none. */
@@ -587,6 +629,62 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		}
 	}
 
+	let python: PiLensProjectPythonConfig | undefined;
+	if (obj.python !== undefined) {
+		if (
+			!obj.python ||
+			typeof obj.python !== "object" ||
+			Array.isArray(obj.python)
+		) {
+			warnInvalidConfigOnce(configPath, "python must be an object");
+		} else {
+			const py = obj.python as Record<string, unknown>;
+			const entry: PiLensProjectPythonConfig = {};
+			if ("interpreter" in py) {
+				if (
+					typeof py.interpreter === "string" &&
+					(PYTHON_INTERPRETER_MODES as readonly string[]).includes(
+						py.interpreter,
+					)
+				) {
+					entry.interpreter = py.interpreter as PythonInterpreterMode;
+				} else {
+					warnInvalidConfigOnce(
+						configPath,
+						`python.interpreter must be one of ${PYTHON_INTERPRETER_MODES.join(", ")}`,
+					);
+				}
+			}
+			if ("testCommand" in py) {
+				// An empty array is a no-op, not a command — treat it as a mistake
+				// rather than storing a prefix that resolves to nothing.
+				const command = Array.isArray(py.testCommand)
+					? py.testCommand.filter((a): a is string => typeof a === "string")
+					: [];
+				if (
+					Array.isArray(py.testCommand) &&
+					command.length === py.testCommand.length &&
+					command.length > 0
+				) {
+					entry.testCommand = command;
+				} else {
+					warnInvalidConfigOnce(
+						configPath,
+						"python.testCommand must be a non-empty array of strings",
+					);
+				}
+			}
+			if (entry.interpreter !== undefined || entry.testCommand) {
+				python = entry;
+			} else if (!("interpreter" in py) && !("testCommand" in py)) {
+				warnInvalidConfigOnce(
+					configPath,
+					"python has no recognized setting (interpreter, testCommand); ignored",
+				);
+			}
+		}
+	}
+
 	// #533 hygiene: mirror the global loader's unknown-key warn so a typo in a
 	// shared `.pi-lens.json` (e.g. `maxProjectFile`, `lps`) produces a signal
 	// instead of silently doing nothing. The recognized set is single-sourced
@@ -631,6 +729,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		>),
 		maxProjectFiles,
 		reviewGraph,
+		python,
 		raw,
 		configPath,
 	};

@@ -22,6 +22,11 @@ import { detectFileRole } from "./file-role.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
+import {
+	findPyprojectDeclaringPytest,
+	findVenvBinary,
+	resolvePytestExec,
+} from "./python-env.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 
@@ -170,6 +175,10 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 	},
 	pytest: {
 		configFiles: ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"],
+		// The declared last resort only. A Python entry point cannot live in
+		// node_modules/.bin or a Node package manager's global bin dir, so the
+		// real chain (venv → uv → python3 → python) is resolved by
+		// `clients/python-env.ts` from resolveExec's pytest branch.
 		command: "python",
 		args: (testFile, _cwd) => ["-m", "pytest", testFile, "--tb=short", "-q"],
 		parseJson: false, // pytest JSON requires plugin, use text parsing
@@ -452,6 +461,12 @@ export class TestRunnerClient {
 					const pyprojectPath = path.join(cwd, cf);
 					if (!fs.existsSync(pyprojectPath)) return false;
 					try {
+						// Deliberately still ini_options-only, and deliberately NOT
+						// widened to a dependency declaration here: this verdict is
+						// cached per project root for every language, so accepting a
+						// dependency list would make a Rust or Go edit in a polyglot
+						// repo resolve to pytest. The dependency-declaration evidence
+						// lives in the Python-gated, uncached Priority 5 below instead.
 						const pyproject = fs.readFileSync(pyprojectPath, "utf-8");
 						const matches = pyproject.includes("[tool.pytest.ini_options]");
 						if (matches) configEvidencePath = pyprojectPath;
@@ -562,6 +577,28 @@ export class TestRunnerClient {
 		const isPythonSource =
 			typeof sourceFilePath === "string" && sourceFilePath.endsWith(".py");
 		if (!isPythonSource) return null;
+
+		const pythonAnchorDir = path.dirname(path.resolve(sourceFilePath));
+
+		// A venv's pytest is invisible to `which`/`where` — pi-lens does not run
+		// with the project's venv activated — so probe the venv itself before
+		// falling back to a PATH probe that can only ever see a global install.
+		const venvPytest = findVenvBinary("pytest", cwd, pythonAnchorDir);
+		if (venvPytest) {
+			this.log(`Detected pytest in venv: ${venvPytest}`);
+			return { runner: "pytest", config: RUNNERS.pytest };
+		}
+
+		// A stock uv/poetry/pdm project declares pytest as a dev dependency and
+		// configures nothing, so Priority 1's `[tool.pytest.ini_options]` probe
+		// reads it as "no pytest". The declaration is the project's own statement
+		// of intent and is honored here, where the source file is known to be
+		// Python and no cross-language verdict is cached.
+		const declaring = findPyprojectDeclaringPytest(cwd, pythonAnchorDir);
+		if (declaring) {
+			this.log(`Detected pytest declared in ${declaring}`);
+			return { runner: "pytest", config: RUNNERS.pytest };
+		}
 
 		try {
 			const whichCmd = process.platform === "win32" ? "where" : "which";
@@ -2594,6 +2631,22 @@ export class TestRunnerClient {
 				return { command: vendorBin, args: config.args(testFile, cwd) };
 			}
 			return { command: "phpunit", args: config.args(testFile, cwd) };
+		}
+
+		// pytest is resolved the same way, one step further out: neither
+		// node_modules/.bin nor any Node package manager's global bin dir can
+		// hold a Python entry point, so the generic resolution below always fell
+		// through to the declared `python -m pytest` — the system interpreter,
+		// which on a .venv/uv project has no pytest at all. `python-env.ts`
+		// owns the real chain (venv → uv → python3 → python).
+		if (runner === "pytest") {
+			const tailArgs = stripWrapperArgs(
+				config.binName ?? runner,
+				config.args(testFile, cwd),
+			);
+			const exec = resolvePytestExec({ cwd, testFile, tailArgs });
+			this.log(`pytest resolved via ${exec.source}: ${exec.command}`);
+			return { command: exec.command, args: exec.args };
 		}
 
 		const binName = config.binName ?? runner;

@@ -11,6 +11,7 @@ import {
 	flushLatencyLog,
 	getLatencyLogPath,
 } from "../../clients/latency-logger.js";
+import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -2722,6 +2723,13 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 	for (const [runnerKey, config] of Object.entries(RUNNERS)) {
 		const binName = config.binName ?? runnerKey;
 
+		// pytest resolves through clients/python-env.ts (venv → uv → python3 →
+		// python), so none of the three paths this matrix models — local bin,
+		// global bin, `config.command` verbatim — applies to it. Its own argv
+		// contract is covered by the dedicated suite below, which restates the
+		// expected tail independently just as this one does.
+		if (runnerKey === "pytest") continue;
+
 		describe(`runner: ${runnerKey}`, () => {
 			it("preserves argv on local-bin resolution", () => {
 				const { tmpDir, cleanup } = setupTestEnvironment(
@@ -2878,5 +2886,373 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 				expect(resolved.args).toEqual(["exec", "rspec", testFile]);
 				expect(findGlobalBinary).toHaveBeenCalledWith("bundle");
 			});
+	});
+});
+
+/**
+ * pytest interpreter resolution (#venv/uv).
+ *
+ * `RUNNERS.pytest` declares `command: "python"`, and `resolveExec`'s generic
+ * path only ever looked in `node_modules/.bin` and the Node package managers'
+ * global bin dirs — neither of which can hold a Python entry point. So every
+ * pytest run fell through to a literal `python -m pytest`: the SYSTEM
+ * interpreter, which on a `.venv`/uv project has no pytest installed (and on
+ * a machine whose `python` is still Python 2.7 runs the wrong interpreter
+ * entirely). Detection had the mirror-image hole: `which pytest` cannot see
+ * `.venv/bin/pytest`, and the `pyproject.toml` probe only accepted
+ * `[tool.pytest.ini_options]`, so a stock uv project (pytest in
+ * `[dependency-groups]`, `uv.lock`, `.venv/`) was never recognised at all.
+ *
+ * Every test here isolates PATH to a temp dir and clears `VIRTUAL_ENV` /
+ * `CONDA_PREFIX`, so the resolution chain is decided by the fixture on disk
+ * rather than by whatever Python the machine running the suite happens to
+ * have — the ambient `pytest`/`python3` on a dev box would otherwise let
+ * these pass without exercising the fixture (shape 7).
+ */
+describe("pytest interpreter resolution — venv / uv / project config", () => {
+	const pyCleanups: Array<() => void> = [];
+	const savedEnv: Record<string, string | undefined> = {};
+
+	beforeEach(() => {
+		for (const key of ["PATH", "Path", "VIRTUAL_ENV", "CONDA_PREFIX"]) {
+			savedEnv[key] = process.env[key];
+		}
+		resetProjectLensConfigCache();
+	});
+
+	afterEach(() => {
+		for (const [key, value] of Object.entries(savedEnv)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		resetProjectLensConfigCache();
+		for (const c of pyCleanups.splice(0)) c();
+	});
+
+	/** Point PATH at exactly `dirs` and unset every venv env var. */
+	function isolatePath(...dirs: string[]): void {
+		delete process.env.VIRTUAL_ENV;
+		delete process.env.CONDA_PREFIX;
+		process.env.PATH = dirs.join(path.delimiter);
+	}
+
+	/** A real, executable file so a PATH scan's exec-bit check accepts it. */
+	function writeFakeBinary(dir: string, name: string): string {
+		const file = path.join(
+			dir,
+			process.platform === "win32" ? `${name}.exe` : name,
+		);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(file, "", { mode: 0o755 });
+		return file;
+	}
+
+	/** Create `<root>/<dirName>/{bin,Scripts}` holding `binaries`. */
+	function makeVenv(
+		root: string,
+		dirName: string,
+		binaries: string[],
+	): { binDir: string; paths: Record<string, string> } {
+		const binDir = path.join(
+			root,
+			dirName,
+			process.platform === "win32" ? "Scripts" : "bin",
+		);
+		const paths: Record<string, string> = {};
+		for (const binary of binaries) {
+			paths[binary] = writeFakeBinary(binDir, binary);
+		}
+		return { binDir, paths };
+	}
+
+	function tempProject(): string {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-pytest-env-");
+		pyCleanups.push(cleanup);
+		return tmpDir;
+	}
+
+	/** The argv tail every branch appends after its own interpreter prefix. */
+	function tail(testFile: string): string[] {
+		return [testFile, "--tb=short", "-q"];
+	}
+
+	function resolve(
+		client: TestRunnerClient,
+		testFile: string,
+		cwd: string,
+	): Promise<{ command: string; args: string[] }> {
+		return (
+			client as unknown as {
+				resolveExec: (
+					runner: string,
+					config: typeof RUNNERS.pytest,
+					testFile: string,
+					cwd: string,
+				) => Promise<{ command: string; args: string[] }>;
+			}
+		).resolveExec("pytest", RUNNERS.pytest, testFile, cwd);
+	}
+
+	it("runs the venv's own pytest entry point when .venv/bin/pytest exists", async () => {
+		const root = tempProject();
+		const { paths } = makeVenv(root, ".venv", ["python", "pytest"]);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		// Pre-fix: { command: "python", args: ["-m", "pytest", ...] }.
+		expect(resolved.command).toBe(paths.pytest);
+		expect(resolved.args).toEqual(tail(testFile));
+	});
+
+	it("falls back to the venv's python -m pytest when the venv has no pytest script", async () => {
+		const root = tempProject();
+		// `venv` (no leading dot) must be honored too, not just `.venv`.
+		const { paths } = makeVenv(root, "venv", ["python"]);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe(paths.python);
+		expect(resolved.args).toEqual(["-m", "pytest", ...tail(testFile)]);
+	});
+
+	it("finds a venv beside the test file, not only at cwd (monorepo layout)", async () => {
+		const root = tempProject();
+		const pkg = path.join(root, "services", "api");
+		const { paths } = makeVenv(pkg, ".venv", ["python", "pytest"]);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const testFile = createTempFile(
+			root,
+			path.join("services", "api", "tests", "test_thing.py"),
+			"",
+		);
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe(paths.pytest);
+		expect(resolved.args).toEqual(tail(testFile));
+	});
+
+	it("honors VIRTUAL_ENV over an on-disk .venv", async () => {
+		const root = tempProject();
+		makeVenv(root, ".venv", ["python", "pytest"]);
+		const active = path.join(root, "active-env");
+		const { paths } = makeVenv(root, "active-env", ["python", "pytest"]);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+		process.env.VIRTUAL_ENV = active;
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe(paths.pytest);
+	});
+
+	it("uses uv run --no-sync for a uv-managed project with no venv on disk", async () => {
+		const root = tempProject();
+		fs.writeFileSync(path.join(root, "uv.lock"), "version = 1\n");
+		const binDir = path.join(root, "path-bin");
+		const uvPath = writeFakeBinary(binDir, "uv");
+		isolatePath(binDir);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		// --no-sync because a test run must never install into the user's
+		// environment behind their back; bare `uv run` would sync first.
+		expect(resolved.command).toBe(uvPath);
+		expect(resolved.args).toEqual([
+			"run",
+			"--no-sync",
+			"pytest",
+			...tail(testFile),
+		]);
+	});
+
+	it("prefers an existing venv over uv even in a uv-managed project", async () => {
+		const root = tempProject();
+		fs.writeFileSync(path.join(root, "uv.lock"), "version = 1\n");
+		const { paths } = makeVenv(root, ".venv", ["python", "pytest"]);
+		const binDir = path.join(root, "path-bin");
+		writeFakeBinary(binDir, "uv");
+		isolatePath(binDir);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe(paths.pytest);
+	});
+
+	it("prefers python3 over python when neither a venv nor uv applies", async () => {
+		const root = tempProject();
+		const binDir = path.join(root, "path-bin");
+		const python3Path = writeFakeBinary(binDir, "python3");
+		writeFakeBinary(binDir, "python");
+		isolatePath(binDir);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		// Pre-fix: "python" — PEP 394's `python3` was never even considered,
+		// so a machine whose `python` is Python 2.7 ran pytest under 2.7.
+		expect(resolved.command).toBe(python3Path);
+		expect(resolved.args).toEqual(["-m", "pytest", ...tail(testFile)]);
+	});
+
+	it("honors python.testCommand from .pi-lens.json over a present venv", async () => {
+		const root = tempProject();
+		makeVenv(root, ".venv", ["python", "pytest"]);
+		fs.writeFileSync(
+			path.join(root, ".pi-lens.json"),
+			JSON.stringify({
+				python: { testCommand: ["uv", "run", "--frozen", "pytest"] },
+			}),
+		);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe("uv");
+		expect(resolved.args).toEqual([
+			"run",
+			"--frozen",
+			"pytest",
+			...tail(testFile),
+		]);
+	});
+
+	it("honors python.interpreter='system', ignoring a present venv", async () => {
+		const root = tempProject();
+		makeVenv(root, ".venv", ["python", "pytest"]);
+		fs.writeFileSync(
+			path.join(root, ".pi-lens.json"),
+			JSON.stringify({ python: { interpreter: "system" } }),
+		);
+		const binDir = path.join(root, "path-bin");
+		const python3Path = writeFakeBinary(binDir, "python3");
+		isolatePath(binDir);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe(python3Path);
+		expect(resolved.args).toEqual(["-m", "pytest", ...tail(testFile)]);
+	});
+
+	it("honors python.interpreter='uv' without a uv.lock marker", async () => {
+		const root = tempProject();
+		fs.writeFileSync(
+			path.join(root, ".pi-lens.json"),
+			JSON.stringify({ python: { interpreter: "uv" } }),
+		);
+		const binDir = path.join(root, "path-bin");
+		const uvPath = writeFakeBinary(binDir, "uv");
+		isolatePath(binDir);
+
+		const testFile = createTempFile(root, "tests/test_thing.py", "");
+		const resolved = await resolve(new TestRunnerClient(false), testFile, root);
+
+		expect(resolved.command).toBe(uvPath);
+		expect(resolved.args).toEqual([
+			"run",
+			"--no-sync",
+			"pytest",
+			...tail(testFile),
+		]);
+	});
+
+	it("detects pytest from a venv entry point with no config file at all", () => {
+		const root = tempProject();
+		makeVenv(root, ".venv", ["python", "pytest"]);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const client = new TestRunnerClient(false);
+		// Pre-fix: null — `which pytest` cannot see into a venv, and PATH here
+		// holds no pytest at all.
+		expect(client.detectRunner(root, path.join(root, "main.py"))?.runner).toBe(
+			"pytest",
+		);
+	});
+
+	it("detects pytest from a uv-style [dependency-groups] declaration", () => {
+		const root = tempProject();
+		fs.writeFileSync(
+			path.join(root, "pyproject.toml"),
+			[
+				"[project]",
+				"name = 'demo'",
+				"version = '0.1.0'",
+				"",
+				"[dependency-groups]",
+				"dev = [",
+				'    "pytest>=8.0.0",',
+				'    "ruff>=0.6.0",',
+				"]",
+				"",
+			].join("\n"),
+		);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const client = new TestRunnerClient(false);
+		// Pre-fix: null — only `[tool.pytest.ini_options]` counted as evidence.
+		expect(client.detectRunner(root, path.join(root, "main.py"))?.runner).toBe(
+			"pytest",
+		);
+	});
+
+	it("does not pick pytest for a non-Python file in a polyglot repo", () => {
+		const root = tempProject();
+		// A Rust package that also ships a Python tool: pytest is declared, but
+		// the file being edited is Rust. The dependency-declaration evidence is
+		// Python-gated precisely because Priority 1's verdict is cached per
+		// project root for every language.
+		fs.writeFileSync(
+			path.join(root, "pyproject.toml"),
+			"[project]\nname = 'demo'\n\n[dependency-groups]\ndev = [\"pytest\"]\n",
+		);
+		fs.writeFileSync(
+			path.join(root, "Cargo.toml"),
+			"[package]\nname = 'demo'\n",
+		);
+		makeVenv(root, ".venv", ["python", "pytest"]);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const client = new TestRunnerClient(false);
+		expect(
+			client.detectRunner(root, path.join(root, "src", "lib.rs"))?.runner,
+		).toBe("cargo");
+	});
+
+	it("still does not infer pytest from a pyproject that never mentions it", () => {
+		const root = tempProject();
+		fs.writeFileSync(
+			path.join(root, "pyproject.toml"),
+			"[project]\nname = 'demo'\nversion = '0.1.0'\ndependencies = ['httpx']\n",
+		);
+		const emptyPath = path.join(root, "empty-path");
+		fs.mkdirSync(emptyPath, { recursive: true });
+		isolatePath(emptyPath);
+
+		const client = new TestRunnerClient(false);
+		expect(client.detectRunner(root, path.join(root, "main.py"))).toBeNull();
 	});
 });
