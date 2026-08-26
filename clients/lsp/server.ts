@@ -1696,20 +1696,37 @@ export function DenoExcludeRoot(primary: RootFunction): RootFunction {
 }
 
 /**
+ * How far above the LSP root a venv search may walk. `PythonServer.root` is a
+ * NEAREST-marker root, so in a monorepo it resolves to the package directory
+ * that owns `pyproject.toml` while the repo's single `.venv` sits further up —
+ * a root-only probe reported "no venv" for that entirely ordinary layout. The
+ * walk is bounded and stops before the home directory, so a stray `~/.venv` is
+ * never adopted as a project's environment.
+ */
+const MAX_PYTHON_VENV_WALK_UP = 6;
+
+/**
  * Find the active Python interpreter inside the nearest virtual environment.
- * Search order: VIRTUAL_ENV → CONDA_PREFIX → .venv → venv (all under root).
+ * Search order: VIRTUAL_ENV → CONDA_PREFIX → `.venv`/`venv` at the root, then
+ * the same two names in each bounded ancestor of the root.
  * Returns undefined when no venv python binary is found.
  */
 export async function detectPythonVenv(
 	root: string,
 ): Promise<string | undefined> {
 	const isWin = process.platform === "win32";
-	const candidates = [
-		process.env.VIRTUAL_ENV,
-		process.env.CONDA_PREFIX,
-		path.join(root, ".venv"),
-		path.join(root, "venv"),
-	].filter((v): v is string => Boolean(v));
+	const candidates = [process.env.VIRTUAL_ENV, process.env.CONDA_PREFIX].filter(
+		(v): v is string => Boolean(v),
+	);
+
+	let dir = path.resolve(root);
+	for (let level = 0; level <= MAX_PYTHON_VENV_WALK_UP; level++) {
+		if (isAtOrAboveHomeDir(dir)) break;
+		candidates.push(path.join(dir, ".venv"), path.join(dir, "venv"));
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
 
 	for (const venv of candidates) {
 		const pythonPath = isWin
@@ -2019,13 +2036,33 @@ export const PythonServer: LSPServerInfo = {
 		const env = await getToolEnvironment();
 		let source: "direct" | "managed" | "package-manager" = "direct";
 
-		// openFilesOnly: true — analyse only open files rather than the full workspace.
-		// Avoids the 5–14 s cold-start on large projects caused by workspace-wide
-		// analysis on startup. Deep type checking is still available via the standalone
-		// pyright CLI runner that runs in parallel.
+		// This blob is BOTH the `initializationOptions` and the source pi-lens
+		// answers `workspace/configuration` from — `resolveConfigurationSection`
+		// (clients/lsp/client.ts) resolves each requested dot-path against it and
+		// returns null when the path is absent. So the nesting is not cosmetic:
+		// it decides whether pyright ever sees the interpreter.
+		//
+		// Verified against a real pyright 1.1.408, not from memory (shape 16):
+		// it requests exactly three sections — `python`, `python.analysis`,
+		// `pyright` — and takes the interpreter from `python.pythonPath`. It does
+		// NOT read `initializationOptions` for it: a probe passing the value only
+		// there still reported every venv import unresolved. A top-level
+		// `pythonPath` therefore resolved to null for section `python`, and the
+		// venv `detectPythonVenv` had just found was silently discarded — pyright
+		// fell back to the system interpreter and reported `Import "x" could not
+		// be resolved` for everything installed in `.venv`.
+		//
+		// `diagnosticMode: "openFilesOnly"` is the same intent the old top-level
+		// `openFilesOnly` key expressed and pyright's actual spelling for it:
+		// analyse open files rather than the whole workspace, avoiding the 5–14 s
+		// cold start on large projects. Deep type checking still comes from the
+		// standalone pyright CLI runner in parallel. It is also pyright's current
+		// default, so this makes a dead key real rather than changing behavior.
 		const pyrightInit = (pythonPath?: string): Record<string, unknown> => ({
-			...(pythonPath ? { pythonPath } : {}),
-			openFilesOnly: true,
+			python: {
+				...(pythonPath ? { pythonPath } : {}),
+				analysis: { diagnosticMode: "openFilesOnly" },
+			},
 		});
 
 		// Prefer pyright-langserver; basedpyright-langserver is a drop-in fork with

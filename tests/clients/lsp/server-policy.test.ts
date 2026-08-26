@@ -1441,6 +1441,130 @@ describe("lsp server policy", () => {
 		}
 	});
 
+	it("detectPythonVenv finds a venv above a monorepo package root", async () => {
+		const { detectPythonVenv } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-venv-up-"));
+		dirs.push(tmp);
+
+		// The layout PythonServer.root actually produces in a monorepo: the
+		// NEAREST marker is the package's own pyproject.toml, so the root is the
+		// package dir while the repo's single venv lives at the repo root.
+		const pkgDir = path.join(tmp, "services", "api");
+		fs.mkdirSync(pkgDir, { recursive: true });
+		fs.writeFileSync(path.join(pkgDir, "pyproject.toml"), "[project]\n");
+		const pythonPath =
+			process.platform === "win32"
+				? path.join(tmp, ".venv", "Scripts", "python.exe")
+				: path.join(tmp, ".venv", "bin", "python");
+		fs.mkdirSync(path.dirname(pythonPath), { recursive: true });
+		fs.writeFileSync(pythonPath, "#!/usr/bin/env python\n");
+
+		const origVENV = process.env.VIRTUAL_ENV;
+		const origCONDA = process.env.CONDA_PREFIX;
+		delete process.env.VIRTUAL_ENV;
+		delete process.env.CONDA_PREFIX;
+
+		try {
+			// Pre-fix: undefined — only `<root>/.venv` and `<root>/venv` were probed.
+			expect(await detectPythonVenv(pkgDir)).toBe(pythonPath);
+		} finally {
+			if (origVENV !== undefined) process.env.VIRTUAL_ENV = origVENV;
+			if (origCONDA !== undefined) process.env.CONDA_PREFIX = origCONDA;
+		}
+	});
+
+	/**
+	 * The blob PythonServer returns is both `initializationOptions` AND what
+	 * pi-lens answers `workspace/configuration` from, so the only assertion that
+	 * means anything is the composition: resolve the sections pyright really
+	 * requests against the real resolver.
+	 *
+	 * Verified against pyright 1.1.408: it requests `python`, `python.analysis`
+	 * and `pyright`, and reads the interpreter from `python.pythonPath` — it does
+	 * not read `initializationOptions` for it. Pre-fix the blob was flat
+	 * (`{ pythonPath, openFilesOnly }`), so section `python` resolved to null and
+	 * the detected venv never reached pyright: every import from `.venv` was
+	 * reported unresolved.
+	 */
+	it("PythonServer hands pyright the venv interpreter on the `python` config section", async () => {
+		const { PythonServer } = await import("../../../clients/lsp/server.js");
+		const { resolveConfigurationSection } =
+			await import("../../../clients/lsp/client.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pyright-cfg-"));
+		dirs.push(tmp);
+
+		const pythonPath =
+			process.platform === "win32"
+				? path.join(tmp, ".venv", "Scripts", "python.exe")
+				: path.join(tmp, ".venv", "bin", "python");
+		fs.mkdirSync(path.dirname(pythonPath), { recursive: true });
+		fs.writeFileSync(pythonPath, "#!/usr/bin/env python\n");
+
+		const origVENV = process.env.VIRTUAL_ENV;
+		const origCONDA = process.env.CONDA_PREFIX;
+		delete process.env.VIRTUAL_ENV;
+		delete process.env.CONDA_PREFIX;
+
+		launchLSP.mockResolvedValue({
+			process: { killed: false } as never,
+			stdin: {} as never,
+			stdout: {} as never,
+			stderr: {} as never,
+			pid: 2222,
+		});
+
+		try {
+			const spawned = await PythonServer.spawn(tmp);
+			expect(spawned).toBeDefined();
+			const blob = spawned?.initialization;
+			expect(resolveConfigurationSection(blob, "python")).toMatchObject({
+				pythonPath,
+			});
+			expect(
+				resolveConfigurationSection(blob, "python.analysis"),
+			).toMatchObject({ diagnosticMode: "openFilesOnly" });
+		} finally {
+			if (origVENV !== undefined) process.env.VIRTUAL_ENV = origVENV;
+			if (origCONDA !== undefined) process.env.CONDA_PREFIX = origCONDA;
+		}
+	});
+
+	it("PythonServer still answers the `python` section when no venv exists", async () => {
+		const { PythonServer } = await import("../../../clients/lsp/server.js");
+		const { resolveConfigurationSection } =
+			await import("../../../clients/lsp/client.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pyright-novenv-"),
+		);
+		dirs.push(tmp);
+
+		const origVENV = process.env.VIRTUAL_ENV;
+		const origCONDA = process.env.CONDA_PREFIX;
+		delete process.env.VIRTUAL_ENV;
+		delete process.env.CONDA_PREFIX;
+
+		launchLSP.mockResolvedValue({
+			process: { killed: false } as never,
+			stdin: {} as never,
+			stdout: {} as never,
+			stderr: {} as never,
+			pid: 3333,
+		});
+
+		try {
+			const spawned = await PythonServer.spawn(tmp);
+			const blob = spawned?.initialization;
+			// An object without `pythonPath`, never null — pyright asking for the
+			// section it always asks for must not get "no config at all".
+			const section = resolveConfigurationSection(blob, "python");
+			expect(section).not.toBeNull();
+			expect(section).not.toHaveProperty("pythonPath");
+		} finally {
+			if (origVENV !== undefined) process.env.VIRTUAL_ENV = origVENV;
+			if (origCONDA !== undefined) process.env.CONDA_PREFIX = origCONDA;
+		}
+	});
+
 	describe("rust-analyzer force-reinstall", () => {
 		const MANAGED =
 			process.platform === "win32"
