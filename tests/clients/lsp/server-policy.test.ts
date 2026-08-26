@@ -1473,6 +1473,45 @@ describe("lsp server policy", () => {
 		}
 	});
 
+	it("detectPythonVenv stops before the home directory", async () => {
+		const { detectPythonVenv } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-venv-home-"));
+		dirs.push(tmp);
+
+		// `tmp` plays the part of the home directory, so the venv sitting in it is
+		// a stray `~/.venv` — never a project's environment. Without the guard the
+		// bounded upward walk would happily adopt it.
+		const pkgDir = path.join(tmp, "projects", "demo");
+		fs.mkdirSync(pkgDir, { recursive: true });
+		const pythonPath =
+			process.platform === "win32"
+				? path.join(tmp, ".venv", "Scripts", "python.exe")
+				: path.join(tmp, ".venv", "bin", "python");
+		fs.mkdirSync(path.dirname(pythonPath), { recursive: true });
+		fs.writeFileSync(pythonPath, "#!/usr/bin/env python\n");
+
+		const origVENV = process.env.VIRTUAL_ENV;
+		const origCONDA = process.env.CONDA_PREFIX;
+		const origHOME = process.env.HOME;
+		const origUSERPROFILE = process.env.USERPROFILE;
+		delete process.env.VIRTUAL_ENV;
+		delete process.env.CONDA_PREFIX;
+		// os.homedir() reads $HOME on POSIX and %USERPROFILE% on Windows.
+		process.env.HOME = tmp;
+		process.env.USERPROFILE = tmp;
+
+		try {
+			expect(await detectPythonVenv(pkgDir)).toBeUndefined();
+		} finally {
+			if (origVENV !== undefined) process.env.VIRTUAL_ENV = origVENV;
+			if (origCONDA !== undefined) process.env.CONDA_PREFIX = origCONDA;
+			if (origHOME === undefined) delete process.env.HOME;
+			else process.env.HOME = origHOME;
+			if (origUSERPROFILE === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = origUSERPROFILE;
+		}
+	});
+
 	/**
 	 * The blob PythonServer returns is both `initializationOptions` AND what
 	 * pi-lens answers `workspace/configuration` from, so the only assertion that
