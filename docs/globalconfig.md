@@ -130,6 +130,9 @@ Note that most toggles from the table above are **user-level only**. Of them, a 
   "maxProjectFiles": 5000,
   "reviewGraph": {
     "maxFiles": 12000
+  },
+  "python": {
+    "interpreter": "auto"
   }
 }
 ```
@@ -247,6 +250,31 @@ Explicit override for the review graph's own file budget (#775), for monorepos t
 - Takes precedence over the adaptive taper described under `maxProjectFiles` above, but the pre-existing `PI_LENS_REVIEW_GRAPH_MAX_FILES` environment variable still wins outright over both when set.
 - Why the review graph tapers instead of scaling flatly like the other four budgets: its per-file cost (tree-sitter parse + import-fact extraction) is measurably higher than a directory-entry count or file-existence check, so an unbounded linear budget on a huge `maxProjectFiles` would risk a very slow cold build on the synchronous edit-hook path. See `clients/project-scale.ts`'s `taperedReviewGraphMaxFiles` doc comment for the exact shape and the measured per-file cost it's grounded in.
 
+### `python`
+
+Which interpreter pi-lens runs the project's Python tooling with. A Python entry point cannot live in `node_modules/.bin` or a Node package manager's global bin dir, which is all the test runner used to look at — so before this section existed, pytest always ran as a bare `python -m pytest` against the system interpreter, which on a `.venv`/uv project has no pytest installed at all.
+
+`python.interpreter` — one of:
+
+| Value | Chain |
+| --- | --- |
+| `"auto"` (default) | the project's venv (`VIRTUAL_ENV`, `CONDA_PREFIX`, then `.venv`/`venv` from the test file's directory up to the project root) → `uv run --no-sync` when the project declares uv (`uv.lock` or `[tool.uv]`) → `python3` → `python` |
+| `"venv"` | venv only; never reaches for uv |
+| `"uv"` | `uv run --no-sync`, with no `uv.lock`/`[tool.uv]` marker required |
+| `"system"` | ignore any venv and use the interpreter on PATH |
+
+`python.testCommand` — a full command prefix, used verbatim with the runner's own argv tail appended. Wins over `interpreter`, which is then not consulted:
+
+```json
+{ "python": { "testCommand": ["uv", "run", "--frozen", "pytest"] } }
+```
+
+- `uv` is always invoked with `--no-sync` when pi-lens picks it, so an edit-triggered test run never installs packages or reaches the network on your behalf. Use `testCommand` if you want different uv flags.
+- Every mode still falls back to `python3`/`python` rather than failing the run, so a configured interpreter that is missing degrades to the old behavior instead of silently reporting no tests.
+- Nothing is cached: a venv created (or this config edited) mid-session is picked up on the next run.
+- Scope: this section governs the **test runner**. The Python LSP (pyright/basedpyright) discovers the venv on its own — `VIRTUAL_ENV`, `CONDA_PREFIX`, then `.venv`/`venv` at the LSP root and a bounded number of directories above it — and is not affected by `interpreter` or `testCommand`.
+- The same venv discovery also feeds **detection** — a `.venv/bin/pytest` is now evidence that a project uses pytest, as is a `pytest` (or `pytest-*`) entry in a `pyproject.toml` dependency group. `which pytest` alone could never see into a venv.
+
 ### Schema rules
 
 - Unknown rule ids are ignored (forward-compat). Unrecognized **top-level** keys are logged once and then ignored — never fatal to the parse. The LSP namespaces a shared file legitimately carries (`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) and `$schema` are tolerated silently; a user-level-only lens key placed here (e.g. `lsp`, `tests`, `delta`) is logged as "not honored at project scope"; anything else is logged as a likely typo. The raw parsed JSON is still exposed for forward-compat consumers regardless.
@@ -255,5 +283,6 @@ Explicit override for the review graph's own file budget (#775), for monorepos t
 - Rule thresholds must be positive finite numbers; invalid, zero, or negative values are logged once and ignored.
 - Mutation-control `enabled` values must be booleans; invalid values are logged once and ignored.
 - `rules.<id>.disable` and `rules.<id>.select` must each be a non-empty array of non-empty strings; a non-array value, an empty array, or an all-whitespace array is logged once and the entry is dropped. A policy-only entry (no `threshold`) is honored. A policy entry with an invalid value still keeps any valid `threshold` alongside it.
+- `python` must be an object; `python.interpreter` must be one of `auto`, `venv`, `uv`, `system`, and `python.testCommand` a non-empty array of strings. An invalid value is logged once and ignored, so the setting falls through to `auto`.
 - The depth sub-threshold of `high-complexity` (default `6`) is intentionally not exposed; only the cyclomatic-complexity knob ships today to keep the schema tight.
 - The file is mtime-cached, so editing it takes effect on the next scan without restarting the agent.
