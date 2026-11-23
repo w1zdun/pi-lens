@@ -1481,3 +1481,88 @@ describe("pytest found on PATH with no pytest config (#5410 D2)", () => {
 		expect(safeSpawnAsync).not.toHaveBeenCalled();
 	});
 });
+
+describe("pytest through uv for a uv project", () => {
+	let originalPath: string | undefined;
+
+	beforeEach(() => {
+		originalPath = process.env.PATH;
+	});
+
+	afterEach(() => {
+		if (originalPath === undefined) delete process.env.PATH;
+		else process.env.PATH = originalPath;
+	});
+
+	/** Put an executable `uv` first on PATH and return its file. */
+	function plantPathUv(): string {
+		const dir = createTempDir("pi-lens-uv-bin-");
+		const file = path.join(dir, "uv");
+		fs.writeFileSync(file, "#!/bin/sh\n");
+		fs.chmodSync(file, 0o755);
+		process.env.PATH = [dir, originalPath ?? ""].join(path.delimiter);
+		return file;
+	}
+
+	async function run(project: { root: string; testFile: string }) {
+		await new TestRunnerClient(false).runTestFileAsync(
+			project.testFile,
+			project.root,
+			{ runner: "pytest", config: RUNNERS.pytest },
+		);
+		expect(safeSpawnAsync).toHaveBeenCalledOnce();
+		const [command, args] = safeSpawnAsync.mock.calls[0];
+		return { command, args };
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"runs the project's existing .venv through uv run --no-sync",
+		async () => {
+			const uv = plantPathUv();
+			const project = createProject(true);
+			fs.writeFileSync(path.join(project.root, "uv.lock"), "");
+
+			const { command, args } = await run(project);
+
+			expect(command).toBe(uv);
+			expect(args.slice(0, 6)).toEqual([
+				"run",
+				"--no-sync",
+				"--project",
+				project.root,
+				"python",
+				"-m",
+			]);
+			expect(args[6]).toBe("pytest");
+		},
+	);
+
+	// Guard: `uv run --no-sync` without a project environment creates an
+	// empty `.venv`, so an environment uv would not pick keeps its interpreter.
+	it.skipIf(process.platform === "win32")(
+		"keeps an activated VIRTUAL_ENV when the uv project has no .venv",
+		async () => {
+			plantPathUv();
+			const project = createProject(false);
+			fs.writeFileSync(path.join(project.root, "uv.lock"), "");
+			const ambient = createEnvironment(createTempDir("pi-lens-ambient-"));
+			process.env.VIRTUAL_ENV = ambient.root;
+
+			const { command } = await run(project);
+
+			expect(command).toBe(ambient.pythonPath);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"keeps the .venv interpreter for a project without uv.lock",
+		async () => {
+			plantPathUv();
+			const project = createProject(true);
+
+			const { command } = await run(project);
+
+			expect(command).toBe(project.pythonPath);
+		},
+	);
+});

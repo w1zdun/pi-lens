@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import os from "node:os";
 import path, { dirname, join } from "node:path";
@@ -374,6 +375,37 @@ export function augmentPythonEnvironment(
 	};
 	if (process.platform === "win32") childEnvironment.Path = augmentedPath;
 	return childEnvironment;
+}
+
+/**
+ * Whether `uv run` would land in `environment` for the uv project at
+ * `projectRoot`, so pytest can go through uv rather than a path guess.
+ *
+ * The environment must already EXIST and be the one uv itself picks: verified
+ * against uv 0.12.5, `uv run --no-sync` on a project without an environment
+ * still creates an empty venv. That is why `VIRTUAL_ENV`, `CONDA_PREFIX` and a
+ * `venv/` directory never qualify: uv ignores them for a project and would
+ * build `.venv` instead.
+ */
+export function isUvRunEnvironment(
+	projectRoot: string,
+	environment: PythonEnvironment,
+): boolean {
+	// A workspace member's lock sits at the workspace root, beside its `.venv`.
+	// ponytail: a member using `UV_PROJECT_ENVIRONMENT` is checked at its own
+	// root only, so it keeps the interpreter path; walk to the workspace root
+	// if that case needs uv.
+	switch (environment.source) {
+		case "uv-workspace":
+			return existsSync(join(dirname(environment.root), "uv.lock"));
+		case "uv-project-environment":
+		case "project-dot-venv":
+			return existsSync(join(projectRoot, "uv.lock"));
+		case "virtual-env":
+		case "conda":
+		case "project-venv":
+			return false;
+	}
 }
 
 /** Return explicit project-environment candidates before a bare PATH fallback. */

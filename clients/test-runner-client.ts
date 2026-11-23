@@ -39,6 +39,7 @@ import { PathKeyedMap } from "./path-keyed-map.js";
 import {
 	augmentPythonEnvironment,
 	detectPythonEnvironment,
+	isUvRunEnvironment,
 } from "./python-environment.js";
 import {
 	direntsHaveMarkerGlobMatch,
@@ -3581,9 +3582,19 @@ export class TestRunnerClient {
 				allowAmbient: !requireOwnInstall,
 			});
 			if (pythonEnvironment) {
+				// A uv project goes through uv, which owns which environment and
+				// interpreter apply. `--no-sync` keeps an edit-triggered run from
+				// installing packages; `python -m pytest` fails loudly in that
+				// environment instead of uv falling back to a PATH pytest.
+				const uv = isUvRunEnvironment(cwd, pythonEnvironment)
+					? findCommandOnPath("uv", process.platform === "win32")
+					: null;
+				const args = config.args(testFile, spawnCwd);
 				return {
-					command: pythonEnvironment.pythonPath,
-					args: config.args(testFile, spawnCwd),
+					command: uv ?? pythonEnvironment.pythonPath,
+					args: uv
+						? ["run", "--no-sync", "--project", cwd, "python", ...args]
+						: args,
 					env: augmentPythonEnvironment(process.env, pythonEnvironment),
 					ownInstall: true,
 				};
